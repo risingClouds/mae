@@ -24,7 +24,7 @@ import torchvision.datasets as datasets
 
 import timm
 
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
@@ -47,7 +47,7 @@ def get_args_parser():
     parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
 
-    parser.add_argument('--input_size', default=224, type=int,
+    parser.add_argument('--input_size', default=512, type=int,
                         help='images input size')
 
     parser.add_argument('--mask_ratio', default=0.75, type=float,
@@ -103,7 +103,79 @@ def get_args_parser():
 
     return parser
 
+import os
+import warnings
+from PIL import Image
+from torch.utils.data import Dataset
+from torchvision import transforms
+from PIL import Image, ImageFile
+import random
+# 允许加载被截断的文件（针对网络传输不完整的情况）
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = 10_000_000_000  # 设置为比图片像素数稍大的值
 
+# 设置分块加载的阈值（单位：字节）
+class ImagePathDataset(Dataset):
+    def __init__(self, txt_file, transform=None):
+        """
+        初始化数据集。
+
+        参数:
+            txt_file (str): 包含图像路径的文本文件路径。
+            transform (callable, optional): 应用于图像的转换。
+        """
+        self.image_paths = []
+        self.transform = transform
+
+        # 读取文本文件，加载所有图像路径
+        with open(txt_file, 'r') as file:
+            for line in file:
+                path = line.strip()  # 去除换行符和空白字符
+                if os.path.isfile(path):  # 检查路径是否有效
+                    self.image_paths.append(path)
+                else:
+                    print(f"警告：文件 {path} 不存在，已跳过。")
+
+    def __len__(self):
+        """返回数据集中图像的数量。"""
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        """
+        获取第 idx 个图像及其 fake label。
+
+        参数:
+            idx (int): 图像索引。
+
+        返回:
+            image (Tensor): 转换后的图像。
+            label (int): 伪标签（固定为 0）。
+        """
+        # 加载图像
+        max_retries = 5  # 最大重试次数
+        original_idx = idx  # 记录原始索引用于警告
+
+        for _ in range(max_retries):
+            try:
+                image_path = self.image_paths[idx]
+                with warnings.catch_warnings():  # 忽略EXIF警告
+                    warnings.simplefilter("ignore")
+                    image = Image.open(image_path).convert('RGB')
+
+            # 在这里添加图像预处理代码（例如transforms）
+                return self.transform(image), 0
+
+            except (IOError, OSError, Image.UnidentifiedImageError) as e:
+            # 生成新索引（排除当前失败索引）
+                available_indices = [i for i in range(len(self.image_paths)) if i != idx]
+                if not available_indices:
+                    raise RuntimeError("所有图像均无法加载")
+                idx = random.choice(available_indices)
+
+        # 超过最大重试次数后抛出详细错误
+        error_msg = f"连续 {max_retries} 次加载失败 (原始索引 {original_idx})"
+        error_msg += f"\n最后尝试路径: {self.image_paths[idx]}"
+        raise RuntimeError(error_msg)
 def main(args):
     misc.init_distributed_mode(args)
 
@@ -125,7 +197,9 @@ def main(args):
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    # dataset_train = ImagePathDataset(args.data_path, transform=transform_train)
+    dataset_train = datasets.ImageFolder(args.data_path, transform=transform_train)
+
     print(dataset_train)
 
     if True:  # args.distributed:
@@ -153,8 +227,10 @@ def main(args):
     )
     
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
-
+    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss,img_size=args.input_size)
+    ckpts = torch.load("mae_pretrain_vit_base.pth")
+    ckpts['model'] = {k:v for k,v in ckpts['model'].items() if 'pos_embed' not in k}
+    model.load_state_dict(ckpts['model'],False)
     model.to(device)
 
     model_without_ddp = model
